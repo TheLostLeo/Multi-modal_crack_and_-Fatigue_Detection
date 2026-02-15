@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data (large files)
+data/
+*.csv
+*.jpg
+*.jpeg
+*.png
+*.wav
+*.mp3
+
+# Models and checkpoints
+checkpoints/
+*.pth
+*.pt
+*.h5
+
+# Logs
+logs/
+*.log
+
+# Outputs
+outputs/
+results/

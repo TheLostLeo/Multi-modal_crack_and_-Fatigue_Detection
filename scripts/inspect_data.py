@@ -1,4 +1,3 @@
-import os
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -27,7 +26,6 @@ def inspect_images():
 
     print("\nLabel Distribution:")
     print(df["label"].value_counts())
-
     print("\nTotal training samples:", len(df))
 
     sample_df = df.sample(4, random_state=42)
@@ -50,57 +48,53 @@ def inspect_images():
 
 
 # ==========================
-# AE INSPECTION
+# ACD WAVEFORM INSPECTION
 # ==========================
 
-def inspect_ae():
+def inspect_acd_waveforms():
 
-    print("\n=== AE DATA ===")
+    print("\n=== ACD WAVEFORM DATA ===")
 
-    sequences = np.load(DATA_ROOT / "processed/ae/ae_sequences.npy")
-    labels = np.load(DATA_ROOT / "processed/ae/ae_labels.npy")
+    X_train = np.load(DATA_ROOT / "processed/ae/waveforms_train.npy")
+    y_train = np.load(DATA_ROOT / "processed/ae/labels_train.npy")
 
-    print("Sequences shape:", sequences.shape)
-    print("Labels shape:", labels.shape)
+    X_test = np.load(DATA_ROOT / "processed/ae/waveforms_test.npy")
+    y_test = np.load(DATA_ROOT / "processed/ae/labels_test.npy")
 
-    print("\nDamage Stage Distribution:")
-    print(pd.Series(labels).value_counts())
+    print("\nTrain shape:", X_train.shape)
+    print("Test shape:", X_test.shape)
 
-    # Basic statistics
-    print("\nFeature Statistics (global):")
-    print("Stress_norm mean:", sequences[:, :, 0].mean())
-    print("Hit_rate mean:", sequences[:, :, 1].mean())
-    print("Hit_acc mean:", sequences[:, :, 2].mean())
+    print("\nTrain Label Distribution:")
+    print(pd.Series(y_train).value_counts())
 
-    # Pick random sample
-    idx = random.randint(0, len(sequences) - 1)
+    print("\nTest Label Distribution:")
+    print(pd.Series(y_test).value_counts())
 
-    seq = sequences[idx]
-    stage = labels[idx]
+    print("\nWaveform statistics (train):")
+    print("Mean:", X_train.mean())
+    print("Std:", X_train.std())
+    print("Min:", X_train.min())
+    print("Max:", X_train.max())
 
-    print(f"\nVisualizing AE sequence index {idx}, Stage {stage}")
+    # Visualize random waveform
+    idx = random.randint(0, len(X_train) - 1)
+    waveform = X_train[idx]
+    label = y_train[idx]
 
-    stress_norm = seq[:, 0]
-    hit_rate = seq[:, 1]
-    hit_acc = seq[:, 2]
+    print(f"\nVisualizing waveform index {idx}, Label {label}")
 
-    fig, axes = plt.subplots(3, 1, figsize=(8, 8))
-
-    axes[0].plot(stress_norm)
-    axes[0].set_title("Normalized Stress")
-
-    axes[1].plot(hit_rate)
-    axes[1].set_title("Hit Rate")
-
-    axes[2].plot(hit_acc)
-    axes[2].set_title("Hit Acceleration")
-
+    plt.figure(figsize=(10, 4))
+    plt.plot(waveform)
+    plt.title(f"ACD Waveform (Label {label})")
+    plt.xlabel("Sample Index")
+    plt.ylabel("Amplitude (mV)")
     plt.tight_layout()
-    save_path = OUTPUT_DIR / "ae_sample.png"
+
+    save_path = OUTPUT_DIR / "acd_waveform_sample.png"
     plt.savefig(save_path)
     plt.close()
 
-    print(f"Saved AE sample plot to: {save_path}")
+    print(f"Saved waveform plot to: {save_path}")
 
 
 # ==========================
@@ -109,5 +103,4 @@ def inspect_ae():
 
 if __name__ == "__main__":
     inspect_images()
-    inspect_ae()
-
+    inspect_acd_waveforms()

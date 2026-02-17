@@ -9,9 +9,11 @@ import cv2
 
 
 IMAGE_EXTENSIONS = [".jpg", ".png", ".jpeg"]
-WINDOW_SIZE = 100
-WINDOW_STRIDE = 50
 
+
+# ==========================
+# UTILITIES
+# ==========================
 
 def ensure_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
@@ -77,112 +79,95 @@ def process_images(raw_dir, processed_dir, metadata_dir, resize=224):
     test_df.to_csv(Path(metadata_dir) / "image_test.csv", index=False)
 
     print("Image processing complete.")
+    print("Train:", len(train_df))
+    print("Val:", len(val_df))
+    print("Test:", len(test_df))
 
 
 # ==========================
-# AE PROCESSING
+# ACD WAVEFORM PROCESSING (ALL CHANNELS, USE waveform_noz)
 # ==========================
-
-def assign_damage_stage(stress_norm):
-
-    stages = np.zeros_like(stress_norm)
-
-    stages[stress_norm >= 0.25] = 1
-    stages[stress_norm >= 0.5] = 2
-    stages[stress_norm >= 0.8] = 3
-
-    return stages
-
 
 def process_ae(raw_ae_path, processed_dir, metadata_dir):
 
-    print("Processing AE dataset...")
+    print("Processing ACD waveform dataset (ALL channels, waveform_noz)...")
 
-    ae_excel = None
+    train_pkl = raw_ae_path / "acd_model_data_5050_sm_df.pkl"
+    test_pkl = raw_ae_path / "acd_test_data_df.pkl"
 
-    for root, _, files in os.walk(raw_ae_path):
-        for file in files:
-            if file.endswith(".xlsx") and "Acoustic" in file:
-                ae_excel = os.path.join(root, file)
-                break
-        if ae_excel:
-            break
+    if not train_pkl.exists() or not test_pkl.exists():
+        raise ValueError("ACD .pkl files not found in raw/ae directory.")
 
-    if ae_excel is None:
-        raise ValueError("Acoustic emission Excel file not found.")
+    train_df = pd.read_pickle(train_pkl).reset_index(drop=True)
+    test_df = pd.read_pickle(test_pkl).reset_index(drop=True)
 
-    df = pd.read_excel(ae_excel)
-    df = df.iloc[2:].reset_index(drop=True)
+    print("Train samples:", len(train_df))
+    print("Test samples:", len(test_df))
 
-    all_sequences = []
-    all_labels = []
-    all_groups = []
+    print("\nTrain channel distribution:")
+    print(train_df["channel"].value_counts())
 
-    experiment_id = 0
+    print("\nTest channel distribution:")
+    print(test_df["channel"].value_counts())
 
-    blocks = [
-        (0, 2),
-        (14, 16)
-    ]
+    # ------------------------------
+    # Use waveform_noz (trimmed)
+    # ------------------------------
+    FIXED_LENGTH = 4096
 
-    for time_idx, stress_idx in blocks:
+    def fix_length(signal, target_len=FIXED_LENGTH):
+        signal = np.array(signal, dtype=np.float32)
+        length = len(signal)
 
-        time = pd.to_numeric(df.iloc[:, time_idx], errors="coerce")
-        stress = pd.to_numeric(df.iloc[:, stress_idx], errors="coerce")
+        if length > target_len:
+            start = (length - target_len) // 2
+            return signal[start:start + target_len]
 
-        clean_df = pd.DataFrame({
-            "time": time,
-            "stress": stress
-        }).dropna()
+        elif length < target_len:
+            padded = np.zeros(target_len, dtype=np.float32)
+            padded[:length] = signal
+            return padded
 
-        if len(clean_df) < WINDOW_SIZE:
-            continue
+        return signal
 
-        time_vals = clean_df["time"].values.astype(float)
-        stress_vals = clean_df["stress"].values.astype(float)
 
-        stress_norm = stress_vals / np.max(stress_vals)
+    X_train = np.stack([
+        fix_length(w) for w in train_df["waveform_noz"].values
+    ])
 
-        stress_rate = np.gradient(stress_vals, time_vals)
-        stress_acc = np.gradient(stress_rate, time_vals)
+    y_train = train_df["crack"].values.astype(np.int64)
 
-        features = np.stack([
-            stress_norm,
-            stress_rate,
-            stress_acc
-        ], axis=1)
+    X_test = np.stack([
+        fix_length(w) for w in test_df["waveform_noz"].values
+    ])
 
-        stages = assign_damage_stage(stress_norm)
-
-        for start in range(0, len(features) - WINDOW_SIZE, WINDOW_STRIDE):
-            end = start + WINDOW_SIZE
-
-            all_sequences.append(features[start:end])
-            all_labels.append(stages[end - 1])
-            all_groups.append(experiment_id)
-
-        experiment_id += 1
-
-    sequences = np.array(all_sequences)
-    labels = np.array(all_labels)
-    groups = np.array(all_groups)
+    y_test = test_df["crack"].values.astype(np.int64)
 
     ensure_dir(processed_dir)
-    np.save(Path(processed_dir) / "ae_sequences.npy", sequences)
-    np.save(Path(processed_dir) / "ae_labels.npy", labels)
-    np.save(Path(processed_dir) / "ae_groups.npy", groups)
+
+    np.save(Path(processed_dir) / "waveforms_train.npy", X_train)
+    np.save(Path(processed_dir) / "labels_train.npy", y_train)
+    np.save(Path(processed_dir) / "waveforms_test.npy", X_test)
+    np.save(Path(processed_dir) / "labels_test.npy", y_test)
 
     ensure_dir(metadata_dir)
+
     pd.DataFrame({
-        "sequence_id": np.arange(len(labels)),
-        "damage_stage": labels,
-        "group_id": groups
-    }).to_csv(Path(metadata_dir) / "ae_labels.csv", index=False)
+        "label": y_train
+    }).to_csv(Path(metadata_dir) / "ae_train_metadata.csv", index=False)
 
-    print("AE processing complete.")
-    print("Total sequences:", len(sequences))
-    print("Unique groups:", np.unique(groups))
+    pd.DataFrame({
+        "label": y_test
+    }).to_csv(Path(metadata_dir) / "ae_test_metadata.csv", index=False)
 
+    print("\nAE waveform preprocessing complete.")
+    print("Train shape:", X_train.shape)
+    print("Test shape:", X_test.shape)
+
+
+# ==========================
+# MAIN
+# ==========================
 
 def main():
 
@@ -193,17 +178,19 @@ def main():
     data_root = Path(args.data_root)
 
     raw_images = data_root / "raw/images/SDNET2018"
-    raw_ae = data_root / "raw/ae/metro_tunnel"
+    raw_ae = data_root / "raw/ae"
 
     processed_images = data_root / "processed/images"
     processed_ae = data_root / "processed/ae"
 
     metadata_dir = data_root / "metadata"
 
-    process_images(raw_images, processed_images, metadata_dir)
-    process_ae(raw_ae, processed_ae, metadata_dir)
+    if raw_images.exists():
+        process_images(raw_images, processed_images, metadata_dir)
+
+    if raw_ae.exists():
+        process_ae(raw_ae, processed_ae, metadata_dir)
 
 
 if __name__ == "__main__":
     main()
-

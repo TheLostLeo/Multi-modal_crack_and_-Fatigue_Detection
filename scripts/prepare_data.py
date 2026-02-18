@@ -3,11 +3,20 @@ import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import cv2
+from scipy import signal
+from sklearn.model_selection import train_test_split
 
 
+# ==========================
+# GLOBAL SETTINGS
+# ==========================
+
+IMAGE_SIZE = 224
+SPECTROGRAM_NFFT = 256
+SPECTROGRAM_HOP = 128
+TARGET_TIME_BINS = 64
 IMAGE_EXTENSIONS = [".jpg", ".png", ".jpeg"]
 
 
@@ -27,7 +36,7 @@ def is_image_file(filename):
 # IMAGE PROCESSING
 # ==========================
 
-def process_images(raw_dir, processed_dir, metadata_dir, resize=224):
+def process_images(raw_dir, processed_dir):
 
     print("Processing SDNET2018 images...")
 
@@ -38,131 +47,161 @@ def process_images(raw_dir, processed_dir, metadata_dir, resize=224):
         for file in files:
             if is_image_file(file):
                 full_path = os.path.join(root, file)
-
                 folder_name = Path(root).name.upper()
                 label = 1 if folder_name.startswith("C") else 0
-
                 image_paths.append(full_path)
                 labels.append(label)
 
-    df = pd.DataFrame({
-        "filepath": image_paths,
-        "label": labels
-    })
+    df = pd.DataFrame({"filepath": image_paths, "label": labels})
 
     train_df, test_df = train_test_split(
         df, test_size=0.2, stratify=df["label"], random_state=42
     )
+
     train_df, val_df = train_test_split(
         train_df, test_size=0.1, stratify=train_df["label"], random_state=42
     )
 
     ensure_dir(processed_dir)
 
-    def process_split(split_df, split_name):
+    def save_split(split_df, split_name):
         split_path = Path(processed_dir) / split_name
         ensure_dir(split_path)
 
         for _, row in tqdm(split_df.iterrows(), total=len(split_df)):
             img = cv2.imread(row["filepath"])
-            img = cv2.resize(img, (resize, resize))
+            img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
             save_path = split_path / f"{Path(row['filepath']).stem}.jpg"
             cv2.imwrite(str(save_path), img)
 
-    process_split(train_df, "train")
-    process_split(val_df, "val")
-    process_split(test_df, "test")
+    save_split(train_df, "train")
+    save_split(val_df, "val")
+    save_split(test_df, "test")
 
-    ensure_dir(metadata_dir)
-    train_df.to_csv(Path(metadata_dir) / "image_train.csv", index=False)
-    val_df.to_csv(Path(metadata_dir) / "image_val.csv", index=False)
-    test_df.to_csv(Path(metadata_dir) / "image_test.csv", index=False)
-
-    print("Image processing complete.")
-    print("Train:", len(train_df))
-    print("Val:", len(val_df))
-    print("Test:", len(test_df))
+    print("Image preprocessing complete.")
+    print("Total samples:", len(df))
 
 
 # ==========================
-# ACD WAVEFORM PROCESSING (ALL CHANNELS, USE waveform_noz)
+# AUDIO PROCESSING
 # ==========================
 
-def process_ae(raw_ae_path, processed_dir, metadata_dir):
+def waveform_to_spectrogram(waveform):
 
-    print("Processing ACD waveform dataset (ALL channels, waveform_noz)...")
+    if np.all(waveform == 0):
+        return None
 
-    train_pkl = raw_ae_path / "acd_model_data_5050_sm_df.pkl"
-    test_pkl = raw_ae_path / "acd_test_data_df.pkl"
+    try:
+        f, t, spec = signal.spectrogram(
+            waveform,
+            nperseg=SPECTROGRAM_NFFT,
+            noverlap=SPECTROGRAM_NFFT - SPECTROGRAM_HOP,
+            scaling="spectrum",
+            mode="magnitude"
+        )
 
-    if not train_pkl.exists() or not test_pkl.exists():
-        raise ValueError("ACD .pkl files not found in raw/ae directory.")
+        if spec.size == 0:
+            return None
 
-    train_df = pd.read_pickle(train_pkl).reset_index(drop=True)
-    test_df = pd.read_pickle(test_pkl).reset_index(drop=True)
+        spec = np.log(spec + 1e-8)
 
-    print("Train samples:", len(train_df))
-    print("Test samples:", len(test_df))
+        if np.isnan(spec).any() or np.isinf(spec).any():
+            return None
 
-    print("\nTrain channel distribution:")
+        mean = np.mean(spec)
+        std = np.std(spec)
+
+        if std < 1e-6:
+            return None
+
+        spec = (spec - mean) / (std + 1e-6)
+
+        time_bins = spec.shape[1]
+
+        if time_bins < TARGET_TIME_BINS:
+            pad_width = TARGET_TIME_BINS - time_bins
+            spec = np.pad(spec, ((0, 0), (0, pad_width)), mode="constant")
+        elif time_bins > TARGET_TIME_BINS:
+            spec = spec[:, :TARGET_TIME_BINS]
+
+        return spec.astype(np.float32)
+
+    except Exception:
+        return None
+
+
+def process_audio(raw_dir, processed_dir):
+
+    print("Processing ACD waveform dataset...")
+
+    train_path = Path(raw_dir) / "acd_model_data_5050_sm_df.pkl"
+    test_path = Path(raw_dir) / "acd_test_data_df.pkl"
+
+    train_df = pd.read_pickle(train_path)
+    test_df = pd.read_pickle(test_path)
+
+    print("\nOriginal train channel distribution:")
     print(train_df["channel"].value_counts())
 
     print("\nTest channel distribution:")
     print(test_df["channel"].value_counts())
 
-    # ------------------------------
-    # Use waveform_noz (trimmed)
-    # ------------------------------
-    FIXED_LENGTH = 4096
+    # ---- Safe channel balancing ----
+    print("\nBalancing training channels...")
 
-    def fix_length(signal, target_len=FIXED_LENGTH):
-        signal = np.array(signal, dtype=np.float32)
-        length = len(signal)
+    min_count = train_df["channel"].value_counts().min()
 
-        if length > target_len:
-            start = (length - target_len) // 2
-            return signal[start:start + target_len]
+    balanced_parts = []
+    for ch in train_df["channel"].unique():
+        subset = train_df[train_df["channel"] == ch]
+        subset = subset.sample(min_count, random_state=42)
+        balanced_parts.append(subset)
 
-        elif length < target_len:
-            padded = np.zeros(target_len, dtype=np.float32)
-            padded[:length] = signal
-            return padded
+    balanced_df = pd.concat(balanced_parts).reset_index(drop=True)
 
-        return signal
+    print("\nBalanced train channel distribution:")
+    print(balanced_df["channel"].value_counts())
 
+    # ---- Generate spectrograms ----
 
-    X_train = np.stack([
-        fix_length(w) for w in train_df["waveform_noz"].values
-    ])
+    X_train, y_train = [], []
 
-    y_train = train_df["crack"].values.astype(np.int64)
+    print("\nGenerating train spectrograms...")
+    for _, row in tqdm(balanced_df.iterrows(), total=len(balanced_df)):
+        waveform = np.array(row["waveform_noz"], dtype=np.float32)
+        spec = waveform_to_spectrogram(waveform)
 
-    X_test = np.stack([
-        fix_length(w) for w in test_df["waveform_noz"].values
-    ])
+        if spec is not None:
+            X_train.append(spec)
+            y_train.append(int(row["crack"]))
 
-    y_test = test_df["crack"].values.astype(np.int64)
+    X_test, y_test = [], []
+
+    print("\nGenerating test spectrograms...")
+    for _, row in tqdm(test_df.iterrows(), total=len(test_df)):
+        waveform = np.array(row["waveform_noz"], dtype=np.float32)
+        spec = waveform_to_spectrogram(waveform)
+
+        if spec is not None:
+            X_test.append(spec)
+            y_test.append(int(row["crack"]))
+
+    X_train = np.stack(X_train)
+    y_train = np.array(y_train)
+
+    X_test = np.stack(X_test)
+    y_test = np.array(y_test)
 
     ensure_dir(processed_dir)
 
-    np.save(Path(processed_dir) / "waveforms_train.npy", X_train)
-    np.save(Path(processed_dir) / "labels_train.npy", y_train)
-    np.save(Path(processed_dir) / "waveforms_test.npy", X_test)
-    np.save(Path(processed_dir) / "labels_test.npy", y_test)
+    np.save(Path(processed_dir) / "X_train.npy", X_train)
+    np.save(Path(processed_dir) / "y_train.npy", y_train)
+    np.save(Path(processed_dir) / "X_test.npy", X_test)
+    np.save(Path(processed_dir) / "y_test.npy", y_test)
 
-    ensure_dir(metadata_dir)
-
-    pd.DataFrame({
-        "label": y_train
-    }).to_csv(Path(metadata_dir) / "ae_train_metadata.csv", index=False)
-
-    pd.DataFrame({
-        "label": y_test
-    }).to_csv(Path(metadata_dir) / "ae_test_metadata.csv", index=False)
-
-    print("\nAE waveform preprocessing complete.")
-    print("Train shape:", X_train.shape)
-    print("Test shape:", X_test.shape)
+    print("\nAudio preprocessing complete.")
+    print("Train spectrogram shape:", X_train.shape)
+    print("Test spectrogram shape:", X_test.shape)
 
 
 # ==========================
@@ -178,19 +217,15 @@ def main():
     data_root = Path(args.data_root)
 
     raw_images = data_root / "raw/images/SDNET2018"
-    raw_ae = data_root / "raw/ae"
+    raw_audio = data_root / "raw/ae"
 
     processed_images = data_root / "processed/images"
-    processed_ae = data_root / "processed/ae"
+    processed_audio = data_root / "processed/ae"
 
-    metadata_dir = data_root / "metadata"
-
-    if raw_images.exists():
-        process_images(raw_images, processed_images, metadata_dir)
-
-    if raw_ae.exists():
-        process_ae(raw_ae, processed_ae, metadata_dir)
+    process_images(raw_images, processed_images)
+    process_audio(raw_audio, processed_audio)
 
 
 if __name__ == "__main__":
     main()
+

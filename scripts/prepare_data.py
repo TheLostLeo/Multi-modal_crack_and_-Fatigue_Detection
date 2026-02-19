@@ -5,7 +5,6 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 import cv2
-from scipy import signal
 from sklearn.model_selection import train_test_split
 
 
@@ -14,10 +13,10 @@ from sklearn.model_selection import train_test_split
 # ==========================
 
 IMAGE_SIZE = 224
-SPECTROGRAM_NFFT = 256
-SPECTROGRAM_HOP = 128
-TARGET_TIME_BINS = 64
 IMAGE_EXTENSIONS = [".jpg", ".png", ".jpeg"]
+
+TARGET_LENGTH = 4096
+RANDOM_STATE = 42
 
 
 # ==========================
@@ -32,11 +31,27 @@ def is_image_file(filename):
     return any(filename.lower().endswith(ext) for ext in IMAGE_EXTENSIONS)
 
 
+def pad_or_truncate(waveform, target_len=TARGET_LENGTH):
+    if len(waveform) < target_len:
+        waveform = np.pad(waveform, (0, target_len - len(waveform)))
+    elif len(waveform) > target_len:
+        waveform = waveform[:target_len]
+    return waveform
+
+
+def normalize_waveform(waveform):
+    mean = np.mean(waveform)
+    std = np.std(waveform)
+    if std < 1e-8:
+        return None
+    return (waveform - mean) / (std + 1e-8)
+
+
 # ==========================
-# IMAGE PROCESSING
+# IMAGE PREPROCESSING
 # ==========================
 
-def process_images(raw_dir, processed_dir):
+def process_images(raw_dir, processed_dir, metadata_dir):
 
     print("Processing SDNET2018 images...")
 
@@ -52,14 +67,17 @@ def process_images(raw_dir, processed_dir):
                 image_paths.append(full_path)
                 labels.append(label)
 
-    df = pd.DataFrame({"filepath": image_paths, "label": labels})
+    df = pd.DataFrame({
+        "filepath": image_paths,
+        "label": labels
+    })
 
     train_df, test_df = train_test_split(
-        df, test_size=0.2, stratify=df["label"], random_state=42
+        df, test_size=0.2, stratify=df["label"], random_state=RANDOM_STATE
     )
 
     train_df, val_df = train_test_split(
-        train_df, test_size=0.1, stratify=train_df["label"], random_state=42
+        train_df, test_size=0.1, stratify=train_df["label"], random_state=RANDOM_STATE
     )
 
     ensure_dir(processed_dir)
@@ -78,119 +96,88 @@ def process_images(raw_dir, processed_dir):
     save_split(val_df, "val")
     save_split(test_df, "test")
 
+    ensure_dir(metadata_dir)
+    train_df.to_csv(Path(metadata_dir) / "image_train.csv", index=False)
+    val_df.to_csv(Path(metadata_dir) / "image_val.csv", index=False)
+    test_df.to_csv(Path(metadata_dir) / "image_test.csv", index=False)
+
     print("Image preprocessing complete.")
-    print("Total samples:", len(df))
+    print("Train:", len(train_df))
+    print("Val:", len(val_df))
+    print("Test:", len(test_df))
 
 
 # ==========================
-# AUDIO PROCESSING
+# AUDIO PREPROCESSING (CLEAN BASELINE)
 # ==========================
-
-def waveform_to_spectrogram(waveform):
-
-    if np.all(waveform == 0):
-        return None
-
-    try:
-        f, t, spec = signal.spectrogram(
-            waveform,
-            nperseg=SPECTROGRAM_NFFT,
-            noverlap=SPECTROGRAM_NFFT - SPECTROGRAM_HOP,
-            scaling="spectrum",
-            mode="magnitude"
-        )
-
-        if spec.size == 0:
-            return None
-
-        spec = np.log(spec + 1e-8)
-
-        if np.isnan(spec).any() or np.isinf(spec).any():
-            return None
-
-        mean = np.mean(spec)
-        std = np.std(spec)
-
-        if std < 1e-6:
-            return None
-
-        spec = (spec - mean) / (std + 1e-6)
-
-        time_bins = spec.shape[1]
-
-        if time_bins < TARGET_TIME_BINS:
-            pad_width = TARGET_TIME_BINS - time_bins
-            spec = np.pad(spec, ((0, 0), (0, pad_width)), mode="constant")
-        elif time_bins > TARGET_TIME_BINS:
-            spec = spec[:, :TARGET_TIME_BINS]
-
-        return spec.astype(np.float32)
-
-    except Exception:
-        return None
-
 
 def process_audio(raw_dir, processed_dir):
 
-    print("Processing ACD waveform dataset...")
+    print("\nProcessing ACD waveform dataset...")
 
     train_path = Path(raw_dir) / "acd_model_data_5050_sm_df.pkl"
     test_path = Path(raw_dir) / "acd_test_data_df.pkl"
 
-    train_df = pd.read_pickle(train_path)
-    test_df = pd.read_pickle(test_path)
+    df_train = pd.read_pickle(train_path)
+    df_test = pd.read_pickle(test_path)
 
-    print("\nOriginal train channel distribution:")
-    print(train_df["channel"].value_counts())
+    df = pd.concat([df_train, df_test], ignore_index=True)
 
-    print("\nTest channel distribution:")
-    print(test_df["channel"].value_counts())
+    print("Original total samples:", len(df))
+    print("Original channel distribution:")
+    print(df["channel"].value_counts())
 
-    # ---- Safe channel balancing ----
-    print("\nBalancing training channels...")
+    # -------------------------
+    # Filter channel 3 only
+    # -------------------------
+    print("\nFiltering channel 3 only...")
+    df = df[df["channel"] == 3.0].reset_index(drop=True)
 
-    min_count = train_df["channel"].value_counts().min()
+    print("Filtered samples:", len(df))
+    print("Crack distribution after filtering:")
+    print(df["crack"].value_counts())
 
-    balanced_parts = []
-    for ch in train_df["channel"].unique():
-        subset = train_df[train_df["channel"] == ch]
-        subset = subset.sample(min_count, random_state=42)
-        balanced_parts.append(subset)
+    # -------------------------
+    # Build dataset
+    # -------------------------
+    X = []
+    y = []
 
-    balanced_df = pd.concat(balanced_parts).reset_index(drop=True)
+    print("\nProcessing waveforms...")
 
-    print("\nBalanced train channel distribution:")
-    print(balanced_df["channel"].value_counts())
-
-    # ---- Generate spectrograms ----
-
-    X_train, y_train = [], []
-
-    print("\nGenerating train spectrograms...")
-    for _, row in tqdm(balanced_df.iterrows(), total=len(balanced_df)):
+    for _, row in tqdm(df.iterrows(), total=len(df)):
         waveform = np.array(row["waveform_noz"], dtype=np.float32)
-        spec = waveform_to_spectrogram(waveform)
 
-        if spec is not None:
-            X_train.append(spec)
-            y_train.append(int(row["crack"]))
+        waveform = normalize_waveform(waveform)
+        if waveform is None:
+            continue
 
-    X_test, y_test = [], []
+        waveform = pad_or_truncate(waveform)
 
-    print("\nGenerating test spectrograms...")
-    for _, row in tqdm(test_df.iterrows(), total=len(test_df)):
-        waveform = np.array(row["waveform_noz"], dtype=np.float32)
-        spec = waveform_to_spectrogram(waveform)
+        X.append(waveform)
+        y.append(int(row["crack"]))
 
-        if spec is not None:
-            X_test.append(spec)
-            y_test.append(int(row["crack"]))
+    X = np.stack(X)
+    y = np.array(y)
 
-    X_train = np.stack(X_train)
-    y_train = np.array(y_train)
+    print("\nFinal dataset shape:", X.shape)
+    print("Final crack distribution:", np.bincount(y))
 
-    X_test = np.stack(X_test)
-    y_test = np.array(y_test)
+    # -------------------------
+    # Stratified split
+    # -------------------------
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        stratify=y,
+        random_state=RANDOM_STATE
+    )
+
+    print("\nTrain shape:", X_train.shape)
+    print("Test shape:", X_test.shape)
+    print("Train crack distribution:", np.bincount(y_train))
+    print("Test crack distribution:", np.bincount(y_test))
 
     ensure_dir(processed_dir)
 
@@ -200,8 +187,6 @@ def process_audio(raw_dir, processed_dir):
     np.save(Path(processed_dir) / "y_test.npy", y_test)
 
     print("\nAudio preprocessing complete.")
-    print("Train spectrogram shape:", X_train.shape)
-    print("Test spectrogram shape:", X_test.shape)
 
 
 # ==========================
@@ -221,8 +206,9 @@ def main():
 
     processed_images = data_root / "processed/images"
     processed_audio = data_root / "processed/ae"
+    metadata_dir = data_root / "metadata"
 
-    process_images(raw_images, processed_images)
+    process_images(raw_images, processed_images, metadata_dir)
     process_audio(raw_audio, processed_audio)
 
 

@@ -5,8 +5,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 # ==========================
 # CONFIG
@@ -15,16 +15,12 @@ import matplotlib.pyplot as plt
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BATCH_SIZE = 32
-EPOCHS = 40
+EPOCHS = 80
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
-PATIENCE = 8
+PATIENCE = 12
 
-TRAIN_DATA = "data/processed/ae/X_train.npy"
-TRAIN_LABELS = "data/processed/ae/y_train.npy"
-TEST_DATA = "data/processed/ae/X_test.npy"
-TEST_LABELS = "data/processed/ae/y_test.npy"
-
+DATA_DIR = "data/processed/ae"
 CHECKPOINT_DIR = "checkpoints/audio"
 LOG_DIR = "logs/audio"
 
@@ -32,7 +28,6 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
 print("Using device:", DEVICE)
-
 
 # ==========================
 # DATASET
@@ -47,29 +42,37 @@ class AudioDataset(Dataset):
     def __len__(self):
         return len(self.X)
 
-    def spec_augment(self, x):
-        # simple time masking
-        if np.random.rand() < 0.5:
-            t = np.random.randint(0, x.shape[1] // 4)
-            t0 = np.random.randint(0, x.shape[1] - t)
-            x[:, t0:t0+t] = 0
-        return x
+    def add_noise(self, x):
+        noise = np.random.normal(0, 0.01, size=x.shape)
+        return x + noise
+
+    def random_shift(self, x):
+        shift = np.random.randint(0, 200)
+        return np.roll(x, shift)
+
+    def amplitude_scale(self, x):
+        scale = np.random.uniform(0.8, 1.2)
+        return x * scale
 
     def __getitem__(self, idx):
         x = self.X[idx]
         y = self.y[idx]
 
         if self.augment:
-            x = self.spec_augment(x.copy())
+            if np.random.rand() < 0.5:
+                x = self.add_noise(x)
+            if np.random.rand() < 0.5:
+                x = self.random_shift(x)
+            if np.random.rand() < 0.5:
+                x = self.amplitude_scale(x)
 
         x = torch.tensor(x, dtype=torch.float32).unsqueeze(0)
         y = torch.tensor(y, dtype=torch.long)
 
         return x, y
 
-
 # ==========================
-# MODEL (Conv2D)
+# MODEL (1D CNN)
 # ==========================
 
 class AudioCNN(nn.Module):
@@ -77,22 +80,20 @@ class AudioCNN(nn.Module):
         super().__init__()
 
         self.features = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.Conv1d(1, 32, kernel_size=7, padding=3),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.MaxPool1d(4),
 
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.MaxPool1d(4),
 
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.AdaptiveAvgPool2d((1,1))
+            nn.AdaptiveAvgPool1d(1)
         )
 
         self.classifier = nn.Sequential(
@@ -102,20 +103,33 @@ class AudioCNN(nn.Module):
 
     def forward(self, x):
         x = self.features(x)
-        x = x.view(x.size(0), -1)
+        x = x.squeeze(-1)
         return self.classifier(x)
 
-
 # ==========================
-# TRAIN FUNCTION
+# TRAINING
 # ==========================
 
 def train():
 
-    X_train = np.load(TRAIN_DATA)
-    y_train = np.load(TRAIN_LABELS)
-    X_test = np.load(TEST_DATA)
-    y_test = np.load(TEST_LABELS)
+    X_train = np.load(f"{DATA_DIR}/X_train.npy")
+    y_train = np.load(f"{DATA_DIR}/y_train.npy")
+    X_test = np.load(f"{DATA_DIR}/X_test.npy")
+    y_test = np.load(f"{DATA_DIR}/y_test.npy")
+
+    print("Train shape:", X_train.shape)
+    print("Test shape:", X_test.shape)
+
+    # ----- CLASS WEIGHTS -----
+    classes = np.unique(y_train)
+    weights = compute_class_weight(
+        class_weight="balanced",
+        classes=classes,
+        y=y_train
+    )
+    class_weights = torch.tensor(weights, dtype=torch.float32).to(DEVICE)
+
+    print("Class weights:", class_weights)
 
     train_dataset = AudioDataset(X_train, y_train, augment=True)
     test_dataset = AudioDataset(X_test, y_test, augment=False)
@@ -124,9 +138,11 @@ def train():
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     model = AudioCNN().to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", patience=5, factor=0.5
+    )
 
     best_f1 = 0
     patience_counter = 0
@@ -151,7 +167,7 @@ def train():
 
         train_loss = running_loss / len(train_loader)
 
-        # Validation
+        # ----- VALIDATION -----
         model.eval()
         all_preds = []
         all_labels = []
@@ -172,7 +188,7 @@ def train():
         print("Val Accuracy:", round(acc, 4))
         print("Val Macro-F1:", round(f1, 4))
 
-        scheduler.step(train_loss)
+        scheduler.step(f1)
 
         if f1 > best_f1:
             best_f1 = f1
@@ -191,8 +207,11 @@ def train():
             print("Early stopping triggered.")
             break
 
-    print("\nBest Validation F1:", best_f1)
+    print("\nBest Crack F1:", best_f1)
 
+# ==========================
+# ENTRY POINT
+# ==========================
 
 if __name__ == "__main__":
     train()
